@@ -2,74 +2,86 @@
 
 ######################################################################
 #    NoctaShell SAFE-SECURITY SETUP (UFW OFF)
-#    - Создание пользователя ryvyj (пароль спрашивает интерактивно)
+#    - Создание пользователя ryvyj (пароль спрашивает)
 #    - sudo без пароля
 #    - Смена SSH порта 22 → 50012
 #    - Полное отключение root SSH входа
 #    - Fail2Ban (SSH)
 #    - sysctl hardening
-#    - Anti-scan iptables
+#    - iptables anti-scan
 #    - UFW выключен
 #    - Порты НЕ трогаются
 ######################################################################
 
-NEW_SSH_PORT=50012
+clear
+echo ""
+echo "------------------------------------------------------"
+echo "   🛡️  NoctaShell SAFE SECURITY INSTALLER"
+echo "        Mode: UFW OFF / Ports Untouched"
+echo "------------------------------------------------------"
+echo ""
+
+######################################################################
+#   1. СОЗДАНИЕ ПОЛЬЗОВАТЕЛЯ
+######################################################################
+echo "[1/10] Создание пользователя 'ryvyj'..."
+
 USERNAME="ryvyj"
 
-echo "=== [1/10] Обновление системы ==="
-apt update -y && apt upgrade -y
-
-######################################################################
-#   СОЗДАНИЕ ПОЛЬЗОВАТЕЛЯ
-######################################################################
-echo "=== [2/10] Создание пользователя '$USERNAME' ==="
-
 if id "$USERNAME" &>/dev/null; then
-    echo "Пользователь '$USERNAME' уже существует. Пропускаем создание."
+    echo "     ↳ Пользователь уже существует — пропускаем."
 else
     adduser "$USERNAME"
     usermod -aG sudo "$USERNAME"
+    echo "     ✔ Пользователь создан."
 fi
+echo ""
 
 ######################################################################
-#   SUDO БЕЗ ПАРОЛЯ
+#   2. SUDO БЕЗ ПАРОЛЯ
 ######################################################################
-echo "=== [3/10] Настройка sudo без пароля ==="
+echo "[2/10] Настройка sudo без пароля..."
 
 echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" >/etc/sudoers.d/${USERNAME}_nopasswd
 chmod 440 /etc/sudoers.d/${USERNAME}_nopasswd
 
+echo "     ✔ Настроено."
+echo ""
+
 ######################################################################
-#   SSH HARDENING + СМЕНА ПОРТА
+#   3. SSH HARDENING + Смена порта
 ######################################################################
-echo "=== [4/10] Настройка SSH + смена порта 22 → $NEW_SSH_PORT ==="
+echo "[3/10] Настройка SSH и смена порта 22 → 50012..."
+
+NEW_SSH_PORT=50012
 
 cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
 
-# Смена порта
 sed -i "s/^#Port 22/Port $NEW_SSH_PORT/" /etc/ssh/sshd_config
 sed -i "s/^Port 22/Port $NEW_SSH_PORT/" /etc/ssh/sshd_config
 
-# Отключение root входа
 sed -i "s/^#PermitRootLogin yes/PermitRootLogin no/" /etc/ssh/sshd_config
 sed -i "s/^PermitRootLogin yes/PermitRootLogin no/" /etc/ssh/sshd_config
 sed -i "s/^#PermitRootLogin prohibit-password/PermitRootLogin no/" /etc/ssh/sshd_config
 sed -i "s/^PermitRootLogin prohibit-password/PermitRootLogin no/" /etc/ssh/sshd_config
 
-# Отключение баннеров
 sed -i "s/^Banner.*/#Banner/" /etc/ssh/sshd_config
+
 rm -f /etc/issue /etc/issue.net
 touch /etc/issue /etc/issue.net
 
 systemctl daemon-reload
 systemctl restart ssh
 
-######################################################################
-#   FAIL2BAN
-######################################################################
-echo "=== [5/10] Установка Fail2Ban ==="
+echo "     ✔ SSH настроен."
+echo ""
 
-apt install -y fail2ban
+######################################################################
+#   4. FAIL2BAN
+######################################################################
+echo "[4/10] Установка и настройка Fail2Ban..."
+
+apt install -y fail2ban >/dev/null 2>&1
 
 cat >/etc/fail2ban/jail.local <<EOF
 [DEFAULT]
@@ -84,71 +96,77 @@ port = $NEW_SSH_PORT
 logpath = /var/log/auth.log
 EOF
 
-systemctl enable fail2ban
+systemctl enable fail2ban >/dev/null 2>&1
 systemctl restart fail2ban
 
+echo "     ✔ Fail2Ban активирован."
+echo ""
+
 ######################################################################
-#   SYSCTL HARDENING
+#   5. SYSCTL HARDENING
 ######################################################################
-echo "=== [6/10] Применение sysctl-hardening ==="
+echo "[5/10] Применение sysctl-защиты..."
 
 cat >/etc/sysctl.d/99-hardening.conf <<EOF
-# Сервер перестаёт отвечать на ping
 net.ipv4.icmp_echo_ignore_all = 1
-
-# SYN cookies (anti-flood)
 net.ipv4.tcp_syncookies = 1
-
-# Отключить redirects
 net.ipv4.conf.all.send_redirects = 0
 net.ipv4.conf.default.send_redirects = 0
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.accept_redirects = 0
-
-# Anti-spoofing
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
 EOF
 
-sysctl --system
+sysctl --system >/dev/null 2>&1
+
+echo "     ✔ sysctl защита включена."
+echo ""
 
 ######################################################################
-#   IPTABLES ANTI-SCAN
+#   6. IPTABLES ANTI-SCAN
 ######################################################################
-echo "=== [7/10] Anti-scan фильтры iptables ==="
+echo "[6/10] Анти-скан iptables фильтры..."
 
-apt install -y iptables-persistent
+apt install -y iptables-persistent >/dev/null 2>&1
 
-# NULL scan
 iptables -A INPUT -p tcp --tcp-flags ALL NONE -j DROP
-# Xmas / FIN scan
 iptables -A INPUT -p tcp ! --syn -m state --state NEW -j DROP
-# Xmas scan
 iptables -A INPUT -p tcp --tcp-flags ALL ALL -j DROP
 
-netfilter-persistent save
+netfilter-persistent save >/dev/null 2>&1
+
+echo "     ✔ Анти-скан фильтры активированы."
+echo ""
 
 ######################################################################
-#   ОТКЛЮЧЕНИЕ UFW
+#   7. UFW OFF
 ######################################################################
-echo "=== [8/10] Полное отключение UFW ==="
-systemctl stop ufw
-systemctl disable ufw
+echo "[7/10] Отключение UFW..."
+
+systemctl stop ufw >/dev/null 2>&1
+systemctl disable ufw >/dev/null 2>&1
+
+echo "     ✔ UFW выключен."
+echo ""
 
 ######################################################################
-#   ФИНАЛ
+#   8. ФИНАЛЬНАЯ СТАТУС-ИНФА
 ######################################################################
-echo "=== [9/10] Настройка завершена ==="
 echo "------------------------------------------------------"
-echo "✔ Root вход:                отключён"
-echo "✔ SSH порт:                 $NEW_SSH_PORT"
-echo "✔ Пользователь:             $USERNAME"
-echo "✔ Пароль sudo:              не требуется"
-echo "✔ UFW firewall:             выключен"
-echo "✔ Fail2Ban:                 включён"
-echo "✔ Anti-scan iptables:       включён"
-echo "✔ sysctl защита:            включена"
-echo "✔ Открытые порты:           НЕ трогались"
+echo "    🟢 Установка завершена успешно"
 echo "------------------------------------------------------"
-echo "Важно: переподключайся так:"
-echo "ssh -p $NEW_SSH_PORT $USERNAME@<IP>"
+echo " Пользователь:            $USERNAME"
+echo " Sudo без пароля:         ✔"
+echo " Root вход:               ✘ отключён"
+echo " SSH порт:                $NEW_SSH_PORT"
+echo " Fail2Ban:                ✔ активен"
+echo " sysctl hardening:        ✔"
+echo " Anti-scan iptables:      ✔"
+echo " Firewall (UFW):          ✘ выключен"
+echo " Порты:                   ✔ НЕ трогались"
+echo "------------------------------------------------------"
+echo " Подключение по SSH теперь:"
+echo "   ssh -p $NEW_SSH_PORT $USERNAME@<IP>"
+echo "------------------------------------------------------"
+echo ""

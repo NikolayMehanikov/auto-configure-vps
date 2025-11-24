@@ -169,7 +169,7 @@ echo ""
 #############################################
 # 7. UFW OFF
 #############################################
-echo -e "${YELLOW}[7/10] Отключаем UFW...${RESET)"
+echo -e "${YELLOW}[7/10] Отключаем UFW...${RESET}"
 
 systemctl stop ufw >/dev/null 2>&1
 systemctl disable ufw >/dev/null 2>&1

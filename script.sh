@@ -19,7 +19,7 @@ fi
 
 clear
 echo -e "${BLUE}------------------------------------------------------${RESET}"
-echo -e "   🛡️  ${GREEN}NoctaShell SAFE SECURITY INSTALLER v4${RESET}"
+echo -e "   🛡️  ${GREEN}SAFE SECURITY INSTALLER v4${RESET}"
 echo -e "        Mode: ${YELLOW}UFW OFF / Ports Untouched${RESET}"
 echo -e "${BLUE}------------------------------------------------------${RESET}"
 echo ""

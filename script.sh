@@ -1,11 +1,12 @@
 #!/bin/bash
 
 #############################################
-# NoctaShell SAFE SECURITY v3
+# NoctaShell SAFE SECURITY v4
+# - НЕ создает пользователя
+# - НЕ отключает root
+# - Меняет пароль root (интерактивно)
 # - Safe Mode (UFW OFF)
-# - FIX: iptables-persistent hang
-# - Full logging + colors
-# - Must be run as root
+# - Anti-scan, Fail2Ban, SSH hardening
 #############################################
 
 # ---------- COLORS ----------
@@ -14,6 +15,8 @@ YELLOW="\e[33m"
 BLUE="\e[34m"
 RED="\e[31m"
 RESET="\e[0m"
+
+NEW_SSH_PORT=50012
 
 # ---------- CHECK ROOT ----------
 if [ "$EUID" -ne 0 ]; then
@@ -24,47 +27,26 @@ fi
 
 clear
 echo -e "${BLUE}------------------------------------------------------${RESET}"
-echo -e "   🛡️  ${GREEN}NoctaShell SAFE SECURITY INSTALLER v3${RESET}"
+echo -e "   🛡️  ${GREEN}NoctaShell SAFE SECURITY INSTALLER v4${RESET}"
 echo -e "        Mode: ${YELLOW}UFW OFF / Ports Untouched${RESET}"
 echo -e "${BLUE}------------------------------------------------------${RESET}"
 echo ""
 
-USERNAME="ryvyj"
-NEW_SSH_PORT=50012
-
 #############################################
-# 1. CREATE USER
+# 1. ROOT PASSWORD CHANGE
 #############################################
-echo -e "${YELLOW}[1/10] Создание пользователя '${USERNAME}'...${RESET}"
+echo -e "${YELLOW}[1/10] Установка нового пароля root...${RESET}"
 sleep 0.4
 
-if id "$USERNAME" &>/dev/null; then
-    echo -e "  ↳ ${BLUE}Пользователь уже существует — пропускаем.${RESET}"
-else
-    echo -e "  → adduser $USERNAME"
-    adduser "$USERNAME"
-    echo -e "  → usermod -aG sudo $USERNAME"
-    usermod -aG sudo "$USERNAME"
-fi
+passwd root
+
+echo -e "  ${GREEN}✔ Пароль root успешно изменён${RESET}"
 echo ""
 
 #############################################
-# 2. SUDO NO-PASSWORD
+# 2. SSH HARDENING + PORT CHANGE
 #############################################
-echo -e "${YELLOW}[2/10] Настройка sudo без пароля...${RESET}"
-sleep 0.4
-
-sudoers_file="/etc/sudoers.d/${USERNAME}_nopasswd"
-echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" > "$sudoers_file"
-chmod 440 "$sudoers_file"
-
-echo -e "  ${GREEN}✔ sudo теперь не требует пароль${RESET}"
-echo ""
-
-#############################################
-# 3. SSH HARDENING + PORT CHANGE
-#############################################
-echo -e "${YELLOW}[3/10] Настройка SSH → порт $NEW_SSH_PORT...${RESET}"
+echo -e "${YELLOW}[2/10] Настройка SSH → порт $NEW_SSH_PORT...${RESET}"
 sleep 0.4
 
 cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
@@ -73,11 +55,7 @@ echo "  → Меняем порт SSH"
 sed -i "s/^#Port 22/Port $NEW_SSH_PORT/" /etc/ssh/sshd_config
 sed -i "s/^Port 22/Port $NEW_SSH_PORT/" /etc/ssh/sshd_config
 
-echo "  → Запрещаем root-login"
-sed -i "s/^#PermitRootLogin.*/PermitRootLogin no/" /etc/ssh/sshd_config
-sed -i "s/^PermitRootLogin.*/PermitRootLogin no/" /etc/ssh/sshd_config
-
-echo "  → Выключаем баннер SSH"
+echo "  → Отключаем SSH баннер"
 sed -i "s/^Banner.*/#Banner/" /etc/ssh/sshd_config
 
 rm -f /etc/issue /etc/issue.net
@@ -87,18 +65,13 @@ echo "  → Перезапускаем SSH"
 systemctl daemon-reload
 systemctl restart ssh
 
-if [ $? -eq 0 ]; then
-    echo -e "  ${GREEN}✔ SSH успешно перезапущен${RESET}"
-else
-    echo -e "  ${RED}❌ Ошибка перезапуска SSH — проверь вручную!${RESET}"
-fi
-
+echo -e "  ${GREEN}✔ SSH успешно перезапущен${RESET}"
 echo ""
 
 #############################################
-# 4. FAIL2BAN
+# 3. FAIL2BAN
 #############################################
-echo -e "${YELLOW}[4/10] Установка и настройка Fail2Ban...${RESET}"
+echo -e "${YELLOW}[3/10] Установка и настройка Fail2Ban...${RESET}"
 sleep 0.4
 
 DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban >/dev/null 2>&1
@@ -123,9 +96,9 @@ echo -e "  ${GREEN}✔ Fail2Ban активирован${RESET}"
 echo ""
 
 #############################################
-# 5. SYSCTL HARDENING
+# 4. SYSCTL HARDENING
 #############################################
-echo -e "${YELLOW}[5/10] Применение sysctl-защиты...${RESET}"
+echo -e "${YELLOW}[4/10] Применение sysctl-защиты...${RESET}"
 sleep 0.4
 
 cat >/etc/sysctl.d/99-hardening.conf <<EOF
@@ -145,9 +118,9 @@ echo -e "  ${GREEN}✔ sysctl защита включена${RESET}"
 echo ""
 
 #############################################
-# 6. IPTABLES ANTI-SCAN
+# 5. IPTABLES ANTI-SCAN
 #############################################
-echo -e "${YELLOW}[6/10] Установка анти-скан фильтров...${RESET}"
+echo -e "${YELLOW}[5/10] Установка анти-скан фильтров...${RESET}"
 sleep 0.4
 
 DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent >/dev/null 2>&1
@@ -167,9 +140,10 @@ echo -e "  ${GREEN}✔ анти-скан защита включена${RESET}"
 echo ""
 
 #############################################
-# 7. UFW OFF
+# 6. UFW OFF
 #############################################
-echo -e "${YELLOW}[7/10] Отключаем UFW...${RESET}"
+echo -e "${YELLOW}[6/10] Отключаем UFW...${RESET}"
+sleep 0.4
 
 systemctl stop ufw >/dev/null 2>&1
 systemctl disable ufw >/dev/null 2>&1
@@ -183,10 +157,9 @@ echo ""
 echo -e "${BLUE}------------------------------------------------------${RESET}"
 echo -e "    🟢 ${GREEN}Установка завершена успешно${RESET}"
 echo -e "${BLUE}------------------------------------------------------${RESET}"
-echo " Пользователь:            $USERNAME"
+echo " Root пароль:              обновлён"
 echo " SSH порт:                $NEW_SSH_PORT"
-echo " Root вход:               выключен"
-echo " Sudo без пароля:         включено"
+echo " Root вход:               разрешён (как ты просил)"
 echo " Fail2Ban:                активен"
 echo " sysctl:                  включён"
 echo " Anti-scan iptables:      включён"
@@ -194,6 +167,6 @@ echo " Firewall (UFW):          отключён"
 echo " Порты:                   НЕ трогались"
 echo -e "${BLUE}------------------------------------------------------${RESET}"
 echo " Новая команда подключения:"
-echo -e "   ${GREEN}ssh -p $NEW_SSH_PORT $USERNAME@<IP>${RESET}"
+echo -e "   ${GREEN}ssh -p $NEW_SSH_PORT root@<IP>${RESET}"
 echo -e "${BLUE}------------------------------------------------------${RESET}"
 echo ""

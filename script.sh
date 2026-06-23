@@ -217,18 +217,64 @@ EOS
         ( crontab -l 2>/dev/null | grep -v 'deploy-hy2-cert.sh'; \
           echo "0 4 * * * /usr/local/bin/deploy-hy2-cert.sh >> /var/log/hy2-cert.log 2>&1" ) | crontab -
 
-        # --- проверка проброса серта в контейнер ноды ---
-        if docker inspect "$NODE" --format '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}' 2>/dev/null \
-            | grep -q "$DEST"; then
-            MOUNT_STATUS="OK"
-            echo -e "  ${GREEN}✔ Маунт серта в контейнер найден${RESET}"
+        # --- проверка/авто-добавление проброса серта в контейнер ноды ---
+        MOUNT_LINE="${DEST}:${DEST}:ro"
+
+        # ищем docker-compose ноды
+        COMPOSE="/opt/remnanode/docker-compose.yml"
+        [ -f "$COMPOSE" ] || COMPOSE=$(find / -name 'docker-compose.yml' -path '*remnanode*' 2>/dev/null | head -n1)
+
+        if docker inspect "$NODE" --format '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}' 2>/dev/null | grep -q "$DEST"; then
+            MOUNT_STATUS="OK (уже был)"
+            echo -e "  ${GREEN}✔ Маунт серта в контейнер уже есть${RESET}"
+        elif [ -n "$COMPOSE" ] && [ -f "$COMPOSE" ]; then
+            echo "  → Маунт отсутствует, добавляю в compose: $COMPOSE"
+
+            if grep -q "$MOUNT_LINE" "$COMPOSE"; then
+                echo "  → Строка уже есть в compose (контейнер не пересоздан)"
+            else
+                # бэкап перед правкой
+                cp "$COMPOSE" "${COMPOSE}.bak.$(date +%s)"
+                # вставляем строку сразу после ключа volumes: с отступом детей +2
+                awk -v ml="$MOUNT_LINE" '
+                    /^[[:space:]]*volumes:[[:space:]]*$/ && !ins {
+                        print
+                        match($0, /^[[:space:]]*/)
+                        indent = substr($0, 1, RLENGTH)
+                        print indent "  - " ml
+                        ins = 1
+                        next
+                    }
+                    { print }
+                    END { if (!ins) exit 3 }
+                ' "$COMPOSE" > "${COMPOSE}.tmp"
+
+                if [ $? -eq 0 ]; then
+                    mv "${COMPOSE}.tmp" "$COMPOSE"
+                    echo -e "  ${GREEN}✔ Строка добавлена (без кавычек, бэкап рядом)${RESET}"
+                else
+                    rm -f "${COMPOSE}.tmp"
+                    echo -e "  ${RED}✘ Ключ volumes: в compose не найден — добавь строку вручную:${RESET}"
+                    echo -e "  ${YELLOW}        - ${MOUNT_LINE}${RESET}"
+                fi
+            fi
+
+            # пересоздаём контейнер, чтобы маунт подхватился (restart не годится)
+            echo "  → Пересоздаю контейнер (docker compose up -d)"
+            ( cd "$(dirname "$COMPOSE")" && docker compose up -d >/dev/null 2>&1 )
+
+            # финальная проверка из самого контейнера
+            if docker inspect "$NODE" --format '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}' 2>/dev/null | grep -q "$DEST"; then
+                MOUNT_STATUS="OK (добавлено)"
+                echo -e "  ${GREEN}✔ Маунт активен, серт виден контейнеру${RESET}"
+            else
+                MOUNT_STATUS="ОШИБКА"
+                echo -e "  ${RED}✘ Маунт всё ещё не виден — проверь compose вручную${RESET}"
+            fi
         else
-            MOUNT_STATUS="ОТСУТСТВУЕТ"
-            echo -e "  ${RED}✘ ВНИМАНИЕ: $DEST не примонтирован в контейнер $NODE${RESET}"
-            echo -e "  ${YELLOW}    hy2 не увидит серт. Добавь в /opt/remnanode/docker-compose.yml:${RESET}"
-            echo -e "  ${YELLOW}      volumes:${RESET}"
-            echo -e "  ${YELLOW}        - '${DEST}:${DEST}:ro'${RESET}"
-            echo -e "  ${YELLOW}    затем: cd /opt/remnanode && docker compose up -d${RESET}"
+            MOUNT_STATUS="ОТСУТСТВУЕТ (compose не найден)"
+            echo -e "  ${RED}✘ docker-compose ноды не найден, маунт не добавлен${RESET}"
+            echo -e "  ${YELLOW}    добавь вручную в volumes: ноды:  - ${MOUNT_LINE}${RESET}"
         fi
 
         CERT_DONE="готово ($CERT_DOMAIN)"

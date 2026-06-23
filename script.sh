@@ -19,9 +19,22 @@ fi
 
 clear
 echo -e "${BLUE}------------------------------------------------------${RESET}"
-echo -e "   🛡️  ${GREEN}SAFE SECURITY INSTALLER v4${RESET}"
+echo -e "   🛡️  ${GREEN}SAFE SECURITY INSTALLER v5${RESET}"
 echo -e "        Mode: ${YELLOW}UFW OFF / Ports Untouched${RESET}"
 echo -e "${BLUE}------------------------------------------------------${RESET}"
+echo ""
+
+#############################################
+# 0. ВЫБОР: НАСТРОЙКА СЕРТА ДЛЯ HYSTERIA2
+#############################################
+echo -e "${YELLOW}Настроить сертификат для Hysteria2 (вытащить из Caddy + cron автопродление)?${RESET}"
+# /dev/tty — чтобы read работал даже при запуске через curl | bash
+if [ -e /dev/tty ]; then
+    read -r -p "  [y/N]: " DO_CERT </dev/tty
+else
+    read -r -p "  [y/N]: " DO_CERT
+fi
+DO_CERT=$(echo "$DO_CERT" | tr '[:upper:]' '[:lower:]')
 echo ""
 
 #############################################
@@ -144,6 +157,90 @@ echo -e "  ${GREEN}✔ UFW выключен${RESET}"
 echo ""
 
 #############################################
+# 7. HYSTERIA2 CERT (опционально)
+#############################################
+CERT_DONE="пропущено"
+CERT_DOMAIN="-"
+MOUNT_STATUS=""
+
+if [ "$DO_CERT" = "y" ]; then
+    echo -e "${YELLOW}[7/10] Настройка сертификата для Hysteria2...${RESET}"
+    sleep 0.4
+
+    NODE="remnanode"
+    DEST="/var/lib/remnawave/configs/xray/ssl"
+
+    # --- автодетект серта Caddy (LE или ZeroSSL, исключая внутренний CA) ---
+    CRT=$(find /var/lib/docker/volumes -path '*acme*' -name '*.crt' 2>/dev/null | head -n1)
+
+    if [ -z "$CRT" ]; then
+        echo -e "  ${RED}✘ Серт Caddy не найден. Caddy запущен и выписал серт на реальный домен?${RESET}"
+        CERT_DONE="ОШИБКА: серт не найден"
+    else
+        CERT_DOMAIN=$(basename "$(dirname "$CRT")")
+        echo -e "  → Найден домен: ${GREEN}${CERT_DOMAIN}${RESET}"
+
+        # --- генерим скрипт деплоя (самодетектирующийся, для cron) ---
+        cat >/usr/local/bin/deploy-hy2-cert.sh <<'EOS'
+#!/usr/bin/env bash
+set -e
+NODE="remnanode"
+DEST="/var/lib/remnawave/configs/xray/ssl"
+
+CRT=$(find /var/lib/docker/volumes -path '*acme*' -name '*.crt' 2>/dev/null | head -n1)
+[ -z "$CRT" ] && { echo "$(date) cert source not found"; exit 1; }
+
+DOMAIN=$(basename "$(dirname "$CRT")")
+SRC=$(dirname "$CRT")
+mkdir -p "$DEST"
+
+# рестарт ноды только если серт реально изменился (первый запуск = копирует)
+if ! cmp -s "$SRC/${DOMAIN}.crt" "$DEST/cert.pem"; then
+    cp "$SRC/${DOMAIN}.crt" "$DEST/cert.pem"
+    cp "$SRC/${DOMAIN}.key" "$DEST/cert.key"
+    chmod 644 "$DEST/cert.pem"
+    chmod 640 "$DEST/cert.key"
+    docker restart "$NODE" >/dev/null 2>&1
+    echo "$(date) cert updated ($DOMAIN), node restarted"
+else
+    echo "$(date) cert unchanged, skip"
+fi
+EOS
+        chmod +x /usr/local/bin/deploy-hy2-cert.sh
+
+        # --- первый деплой серта сейчас ---
+        echo "  → Деплоим серт в ноду"
+        /usr/local/bin/deploy-hy2-cert.sh >>/var/log/hy2-cert.log 2>&1
+
+        # --- cron на автопродление (идемпотентно, без дублей) ---
+        echo "  → Ставим cron (ежедневно 04:00)"
+        ( crontab -l 2>/dev/null | grep -v 'deploy-hy2-cert.sh'; \
+          echo "0 4 * * * /usr/local/bin/deploy-hy2-cert.sh >> /var/log/hy2-cert.log 2>&1" ) | crontab -
+
+        # --- проверка проброса серта в контейнер ноды ---
+        if docker inspect "$NODE" --format '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}' 2>/dev/null \
+            | grep -q "$DEST"; then
+            MOUNT_STATUS="OK"
+            echo -e "  ${GREEN}✔ Маунт серта в контейнер найден${RESET}"
+        else
+            MOUNT_STATUS="ОТСУТСТВУЕТ"
+            echo -e "  ${RED}✘ ВНИМАНИЕ: $DEST не примонтирован в контейнер $NODE${RESET}"
+            echo -e "  ${YELLOW}    hy2 не увидит серт. Добавь в /opt/remnanode/docker-compose.yml:${RESET}"
+            echo -e "  ${YELLOW}      volumes:${RESET}"
+            echo -e "  ${YELLOW}        - '${DEST}:${DEST}:ro'${RESET}"
+            echo -e "  ${YELLOW}    затем: cd /opt/remnanode && docker compose up -d${RESET}"
+        fi
+
+        CERT_DONE="готово ($CERT_DOMAIN)"
+        echo -e "  ${GREEN}✔ Сертификат для Hysteria2 настроен${RESET}"
+    fi
+    echo ""
+else
+    echo -e "${YELLOW}[7/10] Сертификат Hysteria2 — пропущен (выбрано N)${RESET}"
+    echo ""
+fi
+
+#############################################
 # FINAL
 #############################################
 echo -e "${BLUE}------------------------------------------------------${RESET}"
@@ -157,6 +254,10 @@ echo " sysctl:                  включён"
 echo " Anti-scan iptables:      включён"
 echo " Firewall (UFW):          отключён"
 echo " Порты:                   НЕ трогались"
+echo " Hysteria2 cert:          $CERT_DONE"
+if [ "$DO_CERT" = "y" ] && [ -n "$MOUNT_STATUS" ]; then
+echo " Маунт серта в контейнер: $MOUNT_STATUS"
+fi
 echo -e "${BLUE}------------------------------------------------------${RESET}"
 echo " Новая команда подключения:"
 echo -e "   ${GREEN}ssh -p $NEW_SSH_PORT root@<IP>${RESET}"

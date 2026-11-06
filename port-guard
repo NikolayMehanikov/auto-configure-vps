@@ -1,0 +1,456 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" != --help && "${1:-}" != -h ]]; then
+    if [[ $(id -u) -ne 0 ]]; then
+        echo "Запусти скрипт от root на Linux-транзите."
+        exit 1
+    fi
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+    if ! command -v apt-get >/dev/null 2>&1; then
+        echo "Нет Python 3. Установи python3 средствами своей ОС и повтори запуск."
+        exit 1
+    fi
+    echo "Нет Python 3. Можно установить python3-minimal без обновления остальных пакетов."
+    read -r -p "Для установки введи INSTALL: " install_answer
+    if [[ "$install_answer" != INSTALL ]]; then
+        exit 1
+    fi
+    apt-get install --no-install-recommends --no-upgrade python3-minimal
+fi
+
+umask 077
+guard_tmp=$(mktemp -d /tmp/nocta-transit-guard.XXXXXXXX)
+cleanup() {
+    rm -f -- "$guard_tmp/transit_guard.py"
+    rmdir -- "$guard_tmp"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+cat > "$guard_tmp/transit_guard.py" <<'NOCTA_EMBEDDED_PYTHON'
+#!/usr/bin/env python3
+import argparse
+import contextlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+
+TABLE = "nocta_transit_guard"
+SERVICE = "nocta-transit-guard.service"
+STATE = Path("/var/lib/nocta-transit-guard")
+INSTALLED = Path("/usr/local/lib/nocta-transit-guard/transit_guard.py")
+UNIT = Path("/etc/systemd/system") / SERVICE
+ROLLBACK_SECONDS = 900
+
+
+def parse_ports(value):
+    ports = set()
+    for part in re.split(r"[\s,]+", value.strip()):
+        if not re.fullmatch(r"[0-9]{1,5}(-[0-9]{1,5})?", part):
+            raise ValueError("Порты: числа или диапазоны, например 994,995,996 или 994-998.")
+        bounds = [int(item) for item in part.split("-")]
+        low, high = bounds[0], bounds[-1]
+        if not 1 <= low <= high <= 65535 or high - low >= 64:
+            raise ValueError("Неверный диапазон портов; максимум 64 порта.")
+        ports.update(range(low, high + 1))
+    if not ports or len(ports) > 64:
+        raise ValueError("Нужно от 1 до 64 портов.")
+    return sorted(ports)
+
+
+def parse_ips(value):
+    addresses = []
+    for part in re.split(r"[\s,]+", value.strip()):
+        address = ipaddress.ip_address(part)
+        if not address.is_global or address.is_multicast or getattr(address, "ipv4_mapped", None):
+            raise ValueError("Укажи публичный IP моста, без подсети; IPv4 пиши обычным адресом.")
+        if str(address) not in addresses:
+            addresses.append(str(address))
+    if not 1 <= len(addresses) <= 64:
+        raise ValueError("Нужно от 1 до 64 IP мостов.")
+    return addresses
+
+
+def endpoint(value):
+    host, port = value.rsplit(":", 1)
+    host = host.strip("[]")
+    if host != "*":
+        address = ipaddress.ip_address(host.split("%", 1)[0])
+        host = str(getattr(address, "ipv4_mapped", None) or address)
+    return host, int(port)
+
+
+def validate_listeners(ports, output, ssh_port):
+    if ssh_port in ports or 22 in ports:
+        raise ValueError("Выбран SSH-порт. Ограничение не применено.")
+    listeners = {port: [] for port in ports}
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) < 5:
+            raise ValueError("Не удалось разобрать список слушателей ss.")
+        _, port = endpoint(fields[3])
+        if port in listeners:
+            listeners[port].append(line)
+    for port, lines in listeners.items():
+        if not lines:
+            raise ValueError("Порт {} не слушается. Сначала проверь профиль и запуск Xray.".format(port))
+        for line in lines:
+            names = re.findall(r'\("([^"\n]+)",pid=', line)
+            if not names or any(name.lower() != "xray" for name in names):
+                raise ValueError("Порт {} принадлежит не Xray или процесс не определён: {}".format(port, line))
+
+
+def rules(config):
+    ports = parse_ports(",".join(str(port) for port in config["ports"]))
+    bridges = parse_ips(" ".join(config["bridges"]))
+    port_set = "{ " + ", ".join(map(str, ports)) + " }"
+    lines = [
+        "add table inet " + TABLE,
+        "flush table inet " + TABLE,
+        "table inet " + TABLE + " {",
+        "    chain input {",
+        "        type filter hook input priority 10; policy accept;",
+        "        tcp dport " + port_set + " ct state established,related counter accept",
+        '        iifname "lo" tcp dport ' + port_set + " counter accept",
+    ]
+    for version, keyword in ((4, "ip"), (6, "ip6")):
+        group = [ip for ip in bridges if ipaddress.ip_address(ip).version == version]
+        if group:
+            lines.append("        " + keyword + " saddr { " + ", ".join(group)
+                         + " } tcp dport " + port_set + " counter accept")
+    lines.extend(["        tcp dport " + port_set + " counter drop", "    }", "}", ""])
+    return "\n".join(lines)
+
+
+def write_text(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8", newline="\n") as stream:
+        os.chmod(temporary, 0o600)
+        stream.write(value)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+def write_json(path, value):
+    write_text(path, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+def read_json(path):
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+
+
+@contextlib.contextmanager
+def locked():
+    import fcntl
+    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (STATE / "lock").open("a") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        yield
+
+
+def run(arguments, data=None, required=True, timeout=30):
+    result = subprocess.run(arguments, input=data, text=True, encoding="utf-8",
+                            errors="replace", capture_output=True, timeout=timeout)
+    if required and result.returncode:
+        raise RuntimeError("Ошибка {}: {}".format(arguments[0], result.stderr.strip() or result.stdout.strip()))
+    return result
+
+
+class Host:
+    def snapshot(self):
+        tables = json.loads(run(["nft", "-j", "list", "tables"]).stdout)["nftables"]
+        exists = any(item.get("table", {}).get("family") == "inet"
+                     and item.get("table", {}).get("name") == TABLE for item in tables)
+        return run(["nft", "-s", "list", "table", "inet", TABLE]).stdout if exists else None
+
+    def check(self, text):
+        run(["nft", "-c", "-f", "-"], text)
+
+    def apply(self, text):
+        run(["nft", "-f", "-"], text)
+
+    def restore(self, previous):
+        text = "add table inet {}\ndelete table inet {}\n".format(TABLE, TABLE)
+        if previous:
+            text += previous
+        self.check(text)
+        self.apply(text)
+
+    def is_enabled(self):
+        result = run(["systemctl", "is-enabled", SERVICE], required=False)
+        return result.stdout.strip() == "enabled"
+
+    def enable(self):
+        run(["systemctl", "enable", SERVICE])
+
+    def disable(self):
+        run(["systemctl", "disable", SERVICE])
+
+    def arm(self, token):
+        name = "nocta-transit-rollback-" + token
+        run(["systemd-run", "--unit=" + name, "--on-active={}s".format(ROLLBACK_SECONDS),
+             "--timer-property=AccuracySec=1s", "--property=Restart=on-failure",
+             "--property=RestartSec=10s", sys.executable, str(INSTALLED), "--rollback", token])
+        run(["systemctl", "is-active", "--quiet", name + ".timer"])
+
+    def cancel(self, token):
+        run(["systemctl", "stop", "nocta-transit-rollback-" + token + ".timer"], required=False)
+
+
+class Manager:
+    def __init__(self, path, host):
+        self.path = path
+        self.host = host
+        self.config_path = path / "confirmed.json"
+        self.pending_path = path / "pending.json"
+
+    def pending(self):
+        return read_json(self.pending_path)
+
+    def saved(self):
+        return read_json(self.config_path)
+
+    def begin(self, config):
+        if self.pending():
+            raise RuntimeError("Предыдущая проверка ещё не завершена. Используй --rollback или --status.")
+        candidate = rules(config)
+        self.host.check(candidate)
+        token = uuid.uuid4().hex
+        state = {"token": token, "config": config, "previous": self.host.snapshot(),
+                 "saved": self.saved(), "enabled": self.host.is_enabled(),
+                 "deadline": time.time() + ROLLBACK_SECONDS, "phase": "pending"}
+        write_json(self.pending_path, state)
+        try:
+            self.host.arm(token)
+        except Exception:
+            self.pending_path.unlink()
+            raise
+        try:
+            self.host.apply(candidate)
+        except Exception:
+            self.rollback(token)
+            raise
+        return token
+
+    def rollback(self, token=None):
+        state = self.pending()
+        if not state or (token and state["token"] != token):
+            return
+        if state["phase"] == "committed":
+            self.pending_path.unlink()
+            return
+        self.host.restore(state["previous"])
+        if state["saved"] is None:
+            if self.config_path.exists():
+                self.config_path.unlink()
+        else:
+            write_json(self.config_path, state["saved"])
+        if state["enabled"]:
+            self.host.enable()
+        else:
+            self.host.disable()
+        self.pending_path.unlink()
+
+    def confirm(self, token):
+        state = self.pending()
+        if not state or state["token"] != token or state["phase"] != "pending":
+            raise RuntimeError("Проверка уже завершилась или была отменена. Запусти скрипт заново.")
+        if time.time() >= state["deadline"]:
+            self.rollback(token)
+            raise RuntimeError("Время проверки истекло. Выполнен откат.")
+        try:
+            self.host.check(rules(state["config"]))
+            self.host.apply(rules(state["config"]))
+            write_json(self.config_path, state["config"])
+            self.host.enable()
+            state["phase"] = "committed"
+            write_json(self.pending_path, state)
+        except Exception:
+            self.rollback(token)
+            raise
+        self.pending_path.unlink()
+
+
+def require_environment(interactive_mode):
+    if sys.platform != "linux" or os.geteuid() != 0:
+        raise RuntimeError("Запускай на Linux-транзите от root.")
+    os.environ["PATH"] = "/usr/sbin:/usr/bin:/sbin:/bin"
+    os.environ["LC_ALL"] = "C"
+    commands = ["nft", "systemctl"]
+    if interactive_mode:
+        commands.extend(["ss", "docker", "systemd-run"])
+    missing = [name for name in commands if not shutil.which(name)]
+    if missing:
+        raise RuntimeError("Нет необходимых команд: " + ", ".join(missing)
+                           + ". Установка firewall-пакетов автоматически не выполняется; см. README.")
+    if not Path("/run/systemd/system").is_dir():
+        raise RuntimeError("Нужен работающий systemd; контейнер без systemd не поддерживается.")
+
+
+def preflight(config, manager):
+    if manager.pending():
+        raise RuntimeError("Есть незавершённая проверка. Сначала --status, затем --rollback при необходимости.")
+    mode = run(["docker", "inspect", "remnanode", "--format", "{{.HostConfig.NetworkMode}} {{.State.Running}}"]).stdout.strip()
+    if mode != "host true":
+        raise RuntimeError("Ожидался работающий remnanode с network_mode: host, получено: " + mode)
+    firewall = json.loads(run(["nft", "-j", "list", "ruleset"]).stdout)["nftables"]
+    tables = [item["table"] for item in firewall if "table" in item]
+    if any(item["name"] == "nocta_nl_guard" for item in tables) or Path("/etc/nocta-nl-guard.nft").exists():
+        raise RuntimeError("Обнаружено готовое ограничение NL. Этот скрипт его не заменяет.")
+    if manager.host.snapshot() is not None and not manager.saved():
+        raise RuntimeError("Таблица " + TABLE + " уже существует без сохранённой конфигурации. Нужна ручная проверка.")
+    ssh = os.environ.get("SSH_CONNECTION", "").split()
+    ssh_port = int(ssh[3]) if len(ssh) == 4 else None
+    validate_listeners(config["ports"], run(["ss", "-H", "-ltnp"]).stdout, ssh_port)
+    print("Существующие входящие цепочки (они сохраняются):")
+    for item in firewall:
+        chain = item.get("chain", {})
+        if chain.get("hook") == "input":
+            print("  {family} {table}/{name}: priority={prio}, policy={policy}".format(
+                family=chain.get("family"), table=chain.get("table"), name=chain.get("name"),
+                prio=chain.get("prio"), policy=chain.get("policy")))
+    peers = set()
+    for line in run(["ss", "-Htn", "state", "established"]).stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 4:
+            raise RuntimeError("Не удалось разобрать установленные соединения ss.")
+        _, port = endpoint(fields[2])
+        peer, _ = endpoint(fields[3])
+        if port in config["ports"] and not ipaddress.ip_address(peer).is_loopback:
+            peers.add(peer)
+    unknown = peers - set(config["bridges"])
+    print("Подключённые сейчас источники: " + (", ".join(sorted(peers)) or "нет"))
+    if unknown:
+        print("ВНИМАНИЕ: новые подключения этих адресов будут запрещены: " + ", ".join(sorted(unknown)))
+        if input("Если это НЕ твои мосты, введи BLOCK; иначе исправь список: ").strip() != "BLOCK":
+            raise RuntimeError("Остановлено. Дополни IP мостов и повтори запуск.")
+    manager.host.check(rules(config))
+
+
+def install_runtime():
+    marker = "Description=Nocta transit guard"
+    if UNIT.exists() and marker not in UNIT.read_text(encoding="utf-8"):
+        raise RuntimeError("Уже существует чужая служба " + str(UNIT))
+    write_text(INSTALLED, Path(__file__).read_text(encoding="utf-8"))
+    unit = "\n".join([
+        "[Unit]", marker, "After=nftables.service netfilter-persistent.service",
+        "Before=docker.service", "", "[Service]", "Type=oneshot", "RemainAfterExit=yes",
+        "ExecStart=" + sys.executable + " " + str(INSTALLED) + " --boot",
+        "ExecReload=" + sys.executable + " " + str(INSTALLED) + " --boot",
+        "", "[Install]", "WantedBy=multi-user.target", "",
+    ])
+    write_text(UNIT, unit)
+    os.chmod(UNIT, 0o644)
+    run(["systemctl", "daemon-reload"])
+
+
+def ask_valid(prompt, parser, default):
+    while True:
+        value = input(prompt + (" [" + default + "]" if default else "") + ": ").strip() or default
+        try:
+            return parser(value)
+        except ValueError as error:
+            print("Ошибка ввода:", error)
+
+
+def interactive(manager):
+    if not sys.stdin.isatty():
+        raise RuntimeError("Запусти скрипт из обычного SSH-терминала, без pipe.")
+    print("Ограничение входящих TCP-портов транзита. Запускай на ТРАНЗИТЕ, не на мосте/выходе.")
+    previous = manager.saved() or {}
+    ports = ask_valid("Порты транзита (например 994-996)", parse_ports,
+                      ",".join(map(str, previous.get("ports", []))))
+    bridges = ask_valid("Публичный IP моста; несколько IP через пробел", parse_ips,
+                        " ".join(previous.get("bridges", [])))
+    config = {"ports": ports, "bridges": bridges}
+    preflight(config, manager)
+    print("\nБудет применено:\n" + rules(config))
+    print("Остальные порты не меняются. Новые IPv6-подключения тоже ограничиваются.")
+    print("Существующие соединения сохраняются, включая уже открытые посторонние.")
+    if input("Применить на 15 минут с автооткатом? Введи APPLY: ").strip() != "APPLY":
+        print("Отменено. Firewall не изменён.")
+        return
+    with locked():
+        if manager.pending():
+            raise RuntimeError("Другой запуск уже начал проверку.")
+        ssh = os.environ.get("SSH_CONNECTION", "").split()
+        ssh_port = int(ssh[3]) if len(ssh) == 4 else None
+        validate_listeners(ports, run(["ss", "-H", "-ltnp"]).stdout, ssh_port)
+        install_runtime()
+        token = manager.begin(config)
+    print("\nПравило временно применено. Автооткат через 15 минут, даже при обрыве SSH.")
+    print("Проверь nc с КАЖДОГО разрешённого моста, затем переподключи VPN и открой сайт.")
+    print("С постороннего сервера новый nc должен получить тайм-аут.")
+    print("Восстановление после нового входа по SSH: python3 " + str(INSTALLED) + " --rollback")
+    try:
+        response = input("Все проверки прошли? SAVE — сохранить; Enter — откатить: ").strip()
+        with locked():
+            if response == "SAVE":
+                manager.confirm(token)
+            else:
+                manager.rollback(token)
+        manager.host.cancel(token)
+        if response == "SAVE":
+            print("Сохранено. Автозагрузка включена. Xray и Docker не перезапускались.")
+            print("Настройки: " + str(manager.config_path))
+        else:
+            print("Выполнен откат.")
+    except (EOFError, KeyboardInterrupt):
+        print("\nПодтверждение не получено. Таймер отката остаётся действовать.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Интерактивное ограничение портов транзита по IP мостов")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--status", action="store_true")
+    group.add_argument("--rollback", nargs="?", const="")
+    group.add_argument("--boot", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    require_environment(not (args.status or args.rollback is not None or args.boot))
+    manager = Manager(STATE, Host())
+    if args.status:
+        with locked():
+            print("Сохранённые настройки:", json.dumps(manager.saved(), ensure_ascii=False))
+            print("Незавершённая проверка:", "да" if manager.pending() else "нет")
+            print("Автозагрузка:", manager.host.is_enabled())
+            print(manager.host.snapshot() or "Таблицы нет.")
+    elif args.rollback is not None:
+        with locked():
+            manager.rollback(args.rollback or None)
+        print("Откат обработан. Без незавершённой проверки изменений нет.")
+    elif args.boot:
+        with locked():
+            pending = manager.pending()
+            if pending and pending["phase"] != "committed":
+                manager.rollback(pending["token"])
+            config = manager.saved()
+            if config:
+                manager.host.check(rules(config))
+                manager.host.apply(rules(config))
+    else:
+        interactive(manager)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as error:
+        print("ОШИБКА:", error, file=sys.stderr)
+        print("Если временное правило уже применено, автооткат сохраняется. Проверь --status.", file=sys.stderr)
+        sys.exit(1)
+NOCTA_EMBEDDED_PYTHON
+
+python3 "$guard_tmp/transit_guard.py" "$@"

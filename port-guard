@@ -107,8 +107,8 @@ def validate_listeners(ports, output, ssh_port):
             raise ValueError("Порт {} не слушается. Сначала проверь профиль и запуск Xray.".format(port))
         for line in lines:
             names = re.findall(r'\("([^"\n]+)",pid=', line)
-            if not names or any(name.lower() != "xray" for name in names):
-                raise ValueError("Порт {} принадлежит не Xray или процесс не определён: {}".format(port, line))
+            if not names or any(name.lower() not in {"xray", "rw-core"} for name in names):
+                raise ValueError("Порт {} принадлежит не Xray/rw-core или процесс не определён: {}".format(port, line))
 
 
 def rules(config):
